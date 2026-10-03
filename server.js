@@ -319,9 +319,23 @@ const outboxQueue = new OutboxQueue();
 
 const debugLogs = [];
 function addLog(type, msg, data = null) {
-    const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data };
-    debugLogs.unshift(entry);
-    if (debugLogs.length > 50) debugLogs.pop();
+    try {
+        let safeData = null;
+        if (data !== null && data !== undefined) {
+            if (typeof data === 'object') {
+                try {
+                    safeData = JSON.parse(JSON.stringify(data, (k, v) => typeof v === 'bigint' ? v.toString() : v));
+                } catch (e) {
+                    safeData = String(data);
+                }
+            } else {
+                safeData = data;
+            }
+        }
+        const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data: safeData };
+        debugLogs.unshift(entry);
+        if (debugLogs.length > 50) debugLogs.pop();
+    } catch (e) {}
     console.log(`[${type}] ${msg}`);
 }
 
@@ -1164,7 +1178,11 @@ app.get('/health', (req, res) => {
 
 // Real-time debug logs endpoint
 app.get('/api/debug-logs', (req, res) => {
-    res.json(debugLogs);
+    try {
+        res.json(debugLogs || []);
+    } catch (e) {
+        res.json([]);
+    }
 });
 
 // Start Server
