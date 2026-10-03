@@ -18,11 +18,28 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3300;
 const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
+const JID_MAP_FILE = path.join(__dirname, 'jid_map.json');
+
+// Persistent JID mapping (supports WhatsApp privacy LIDs and phone numbers)
+let jidMap = {};
+try {
+    if (fs.existsSync(JID_MAP_FILE)) {
+        jidMap = JSON.parse(fs.readFileSync(JID_MAP_FILE, 'utf8'));
+    }
+} catch (e) {
+    jidMap = {};
+}
+
+function saveJidMap() {
+    try {
+        fs.writeFileSync(JID_MAP_FILE, JSON.stringify(jidMap, null, 2), 'utf8');
+    } catch (e) {}
+}
 
 // Configuration
 let wpWebhookUrl = process.env.WP_WEBHOOK_URL || 'https://metromaa.com/wp-json/socialsync/v1/webhook';
 let wpVerifyToken = process.env.WP_VERIFY_TOKEN || 'my_secret_token_123';
-let tunnelUrl = null;
+let tunnelUrl = process.env.PUBLIC_URL || null;
 let tunnelInstance = null;
 let wpRegistered = false;
 
@@ -35,13 +52,102 @@ let currentQR = null;
 let connectionStatus = 'connecting'; // 'connecting' | 'qr_ready' | 'connected' | 'disconnected'
 let connectedPhone = null;
 let connectedName = null;
+let syncTimeout = null;
 
 const logger = pino({ level: 'silent' });
+
+// -------------------------------------------------------------
+// Cloud Session Persistence (Syncs WhatsApp credentials to/from WordPress)
+// -------------------------------------------------------------
+async function syncAuthToWordPress() {
+    try {
+        if (!fs.existsSync(AUTH_DIR)) return;
+        const files = fs.readdirSync(AUTH_DIR);
+        if (!files.includes('creds.json')) return;
+
+        const authBundle = {};
+        for (const file of files) {
+            if (file.endsWith('.json')) {
+                authBundle[file] = fs.readFileSync(path.join(AUTH_DIR, file), 'utf8');
+            }
+        }
+
+        // Include jidMap in the sync bundle
+        authBundle['__jid_map__'] = JSON.stringify(jidMap);
+
+        const syncEndpoint = wpWebhookUrl.replace(/\/webhook\/?$/, '/bridge-auth-save');
+        console.log(`📡 [Auth Persistence] Backing up WhatsApp session to WordPress: ${syncEndpoint}`);
+
+        const res = await fetch(syncEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                token: wpVerifyToken,
+                auth_bundle: authBundle
+            })
+        });
+
+        const resData = await res.json();
+        if (resData && resData.success) {
+            console.log(`💾 [Auth Persistence] WhatsApp session securely saved to WordPress backup!`);
+        }
+    } catch (err) {
+        console.warn(`⚠️ [Auth Backup Notice]: Could not sync auth to WordPress (${err.message})`);
+    }
+}
+
+function debounceSyncAuthToWordPress() {
+    if (syncTimeout) clearTimeout(syncTimeout);
+    syncTimeout = setTimeout(syncAuthToWordPress, 4000);
+}
+
+async function restoreAuthFromWordPress() {
+    try {
+        if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+            console.log('ℹ️ Local creds.json already exists in container.');
+            return;
+        }
+
+        console.log('🔄 Checking WordPress for saved WhatsApp session backup...');
+        const loadEndpoint = wpWebhookUrl.replace(/\/webhook\/?$/, '/bridge-auth-load');
+        const res = await fetch(loadEndpoint, {
+            headers: { 'X-Verify-Token': wpVerifyToken }
+        });
+        const data = await res.json();
+        if (data && data.success && data.auth_bundle) {
+            fs.mkdirSync(AUTH_DIR, { recursive: true });
+            let restoredFiles = 0;
+            for (const [filename, content] of Object.entries(data.auth_bundle)) {
+                if (filename === '__jid_map__') {
+                    try {
+                        jidMap = Object.assign(jidMap, JSON.parse(content));
+                        saveJidMap();
+                    } catch (e) {}
+                    continue;
+                }
+                fs.writeFileSync(path.join(AUTH_DIR, filename), content, 'utf8');
+                restoredFiles++;
+            }
+            console.log(`✅ [Session Restored] Restored ${restoredFiles} auth files from WordPress backup!`);
+        } else {
+            console.log('ℹ️ No existing WhatsApp session backup found on WordPress.');
+        }
+    } catch (err) {
+        console.warn('⚠️ Could not restore session from WordPress:', err.message);
+    }
+}
 
 // -------------------------------------------------------------
 // Tunnel Integration (Allows remote WordPress to reach local bridge)
 // -------------------------------------------------------------
 async function initTunnel() {
+    if (process.env.RENDER || process.env.PUBLIC_URL || process.env.NO_TUNNEL) {
+        tunnelUrl = process.env.PUBLIC_URL || 'https://whatsapp-bridge-dfc0.onrender.com';
+        console.log(`🌐 [Cloud Mode] Using Public Render URL: ${tunnelUrl} (localtunnel disabled)`);
+        await registerWithWordPress(tunnelUrl);
+        return;
+    }
+
     try {
         console.log('🔄 [Tunnel] Connecting local bridge to public secure tunnel...');
         tunnelInstance = await localtunnel({ port: PORT });
@@ -128,7 +234,10 @@ async function initWhatsApp(isRestart = false) {
             keepAliveIntervalMs: 25000,
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', async () => {
+            await saveCreds();
+            debounceSyncAuthToWordPress();
+        });
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -172,6 +281,9 @@ async function initWhatsApp(isRestart = false) {
                 }
                 console.log(`✅ [Nexora WhatsApp Bridge] WhatsApp Connected Successfully! +${connectedPhone} (${connectedName})`);
 
+                // Sync newly authenticated state to WordPress backup immediately
+                debounceSyncAuthToWordPress();
+
                 // Re-sync with WordPress on successful connection
                 if (tunnelUrl) {
                     registerWithWordPress(tunnelUrl);
@@ -207,6 +319,11 @@ function addLog(type, msg, data = null) {
 
                     const senderPhone = remoteJid.split('@')[0];
                     const pushName = msg.pushName || `Customer ${senderPhone.slice(-4)}`;
+
+                    // Track JID mapping for WhatsApp Privacy LIDs (@lid) vs standard numbers (@s.whatsapp.net)
+                    jidMap[senderPhone] = remoteJid;
+                    jidMap[remoteJid] = remoteJid;
+                    saveJidMap();
                     
                     const msgContent = msg.message?.ephemeralMessage?.message || 
                                        msg.message?.viewOnceMessage?.message || 
@@ -223,7 +340,7 @@ function addLog(type, msg, data = null) {
                         text = msgContent.imageMessage.caption;
                     }
 
-                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}): "${text}"`);
+                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"`);
 
                     if (!text) continue;
 
@@ -290,15 +407,35 @@ async function forwardMessageToWordPress(payload) {
     }
 }
 
-// Format phone into WhatsApp JID
-function formatJid(phone) {
-    let clean = String(phone).replace(/\D/g, '');
-    if (clean.startsWith('0')) {
-        clean = '88' + clean;
-    } else if (clean.length === 10 && clean.startsWith('1')) {
-        clean = '880' + clean;
+// Format phone or LID into accurate WhatsApp destination JID
+function formatJid(target) {
+    if (!target) return '';
+    target = String(target).trim();
+
+    // Already a fully qualified JID
+    if (target.endsWith('@lid') || target.endsWith('@s.whatsapp.net')) {
+        return target;
     }
-    return clean.includes('@s.whatsapp.net') ? clean : `${clean}@s.whatsapp.net`;
+
+    const cleanDigits = target.replace(/\D/g, '');
+
+    // Check if we mapped this user's JID previously (e.g. from incoming message)
+    if (jidMap[target]) return jidMap[target];
+    if (jidMap[cleanDigits]) return jidMap[cleanDigits];
+
+    // If cleanDigits is 14+ characters and doesn't begin with Bangladesh prefixes (880 or 01), it's a WhatsApp LID
+    if (cleanDigits.length >= 14 && !cleanDigits.startsWith('880') && !cleanDigits.startsWith('01')) {
+        return `${cleanDigits}@lid`;
+    }
+
+    // Standard phone number format
+    let phone = cleanDigits;
+    if (phone.startsWith('0')) {
+        phone = '88' + phone;
+    } else if (phone.length === 10 && phone.startsWith('1')) {
+        phone = '880' + phone;
+    }
+    return `${phone}@s.whatsapp.net`;
 }
 
 // -------------------------------------------------------------
@@ -831,6 +968,16 @@ app.post('/api/logout', async (req, res) => {
         currentQR = null;
         connectedPhone = null;
 
+        // Clear auth backup from WordPress on explicit logout
+        try {
+            const clearEndpoint = wpWebhookUrl.replace(/\/webhook\/?$/, '/bridge-auth-clear');
+            await fetch(clearEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: wpVerifyToken })
+            });
+        } catch (e) {}
+
         setTimeout(() => initWhatsApp(true), 1500);
 
         return res.json({
@@ -882,13 +1029,18 @@ app.get('/api/debug-logs', (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`=======================================================`);
     console.log(`🚀 Nexora WhatsApp Web Bridge listening on port ${PORT}`);
     console.log(`👉 Webhook target: ${wpWebhookUrl}`);
     console.log(`👉 Dashboard: http://localhost:${PORT}`);
     console.log(`=======================================================`);
+
+    // Restore persistent WhatsApp credentials from WordPress backup if local container restarted
+    await restoreAuthFromWordPress();
+
     initWhatsApp();
+
     if (!process.env.NO_TUNNEL) {
         initTunnel();
     }
