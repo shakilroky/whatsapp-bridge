@@ -208,10 +208,140 @@ async function registerWithWordPress(urlToRegister) {
 }
 
 // -------------------------------------------------------------
+// Message Deduplication & Inbound Cache
+// -------------------------------------------------------------
+const seenMessageIds = new Set();
+function isDuplicateMessage(msgId) {
+    if (!msgId) return false;
+    if (seenMessageIds.has(msgId)) return true;
+    seenMessageIds.add(msgId);
+    if (seenMessageIds.size > 2000) {
+        const firstKey = seenMessageIds.values().next().value;
+        seenMessageIds.delete(firstKey);
+    }
+    return false;
+}
+
+// -------------------------------------------------------------
+// High-Concurrency Outbox Queue (Anti-Flood, Stagger & Socket Guard)
+// Prevents Baileys WebSocket crashes when 10+ users message simultaneously
+// -------------------------------------------------------------
+class OutboxQueue {
+    constructor() {
+        this.queue = [];
+        this.processing = false;
+        this.maxRetries = 3;
+    }
+
+    enqueue(task) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({
+                ...task,
+                resolve,
+                reject,
+                retries: 0,
+                enqueuedAt: Date.now()
+            });
+            this.process();
+        });
+    }
+
+    async process() {
+        if (this.processing) return;
+        this.processing = true;
+
+        while (this.queue.length > 0) {
+            const item = this.queue.shift();
+
+            // Wait if socket is temporarily reconnecting
+            if (!sock || connectionStatus !== 'connected') {
+                if (item.retries < this.maxRetries) {
+                    item.retries++;
+                    console.log(`⏳ [Outbox Queue] Socket reconnecting... Retrying message in 2s (attempt ${item.retries}/${this.maxRetries})`);
+                    this.queue.unshift(item);
+                    await new Promise(r => setTimeout(r, 2000));
+                    continue;
+                } else {
+                    item.reject(new Error('WhatsApp socket is not connected.'));
+                    continue;
+                }
+            }
+
+            try {
+                // 1. Send realistic typing presence update (mimics human typing & stabilizes Baileys socket)
+                try {
+                    await sock.sendPresenceUpdate('composing', item.jid);
+                } catch (e) {}
+
+                // 2. Natural human-like dispatch pacing (300ms - 450ms)
+                await new Promise(r => setTimeout(r, 350));
+
+                let result;
+                if (item.imageUrl) {
+                    result = await sock.sendMessage(item.jid, {
+                        image: { url: item.imageUrl },
+                        caption: item.caption || item.text || ''
+                    });
+                } else {
+                    result = await sock.sendMessage(item.jid, {
+                        text: item.text
+                    });
+                }
+
+                try {
+                    await sock.sendPresenceUpdate('paused', item.jid);
+                } catch (e) {}
+
+                console.log(`📤 [WhatsApp Sent] To: ${item.jid} | ID: ${result?.key?.id}`);
+                addLog('OUTBOX_SENT', `To: ${item.jid} | ID: ${result?.key?.id}`);
+                item.resolve(result);
+
+                // 3. Stagger delay between sequential socket frame dispatches
+                await new Promise(r => setTimeout(r, 200));
+
+            } catch (err) {
+                console.error(`⚠️ [Outbox Error] Send failed (${err.message}). Retries left: ${this.maxRetries - item.retries}`);
+                if (item.retries < this.maxRetries) {
+                    item.retries++;
+                    this.queue.unshift(item);
+                    await new Promise(r => setTimeout(r, 1200));
+                } else {
+                    item.reject(err);
+                }
+            }
+        }
+
+        this.processing = false;
+    }
+}
+
+const outboxQueue = new OutboxQueue();
+
+const debugLogs = [];
+function addLog(type, msg, data = null) {
+    const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data };
+    debugLogs.unshift(entry);
+    if (debugLogs.length > 50) debugLogs.pop();
+    console.log(`[${type}] ${msg}`);
+}
+
+// -------------------------------------------------------------
 // WhatsApp Socket Initialization (Baileys)
 // -------------------------------------------------------------
+let reconnectTimeout = null;
+let isReconnecting = false;
+
 async function initWhatsApp(isRestart = false) {
+    if (isReconnecting) return;
+    isReconnecting = true;
+
     try {
+        if (sock) {
+            try { sock.ev.removeAllListeners(); } catch (e) {}
+            try { sock.ws?.close(); } catch (e) {}
+            sock = null;
+        }
+
         if (!fs.existsSync(AUTH_DIR)) {
             fs.mkdirSync(AUTH_DIR, { recursive: true });
         }
@@ -231,8 +361,12 @@ async function initWhatsApp(isRestart = false) {
             browser: ['Nexora AI Automation', 'Chrome', '124.0.0.0'],
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000,
+            keepAliveIntervalMs: 15000,
+            retryRequestDelayMs: 500,
+            maxMsgRetryCount: 5,
         });
+
+        isReconnecting = false;
 
         sock.ev.on('creds.update', async () => {
             await saveCreds();
@@ -262,17 +396,31 @@ async function initWhatsApp(isRestart = false) {
                 connectedPhone = null;
 
                 if (shouldReconnect) {
-                    setTimeout(() => initWhatsApp(true), 3000);
+                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                    // Code 515: Stream restart required, reconnect fast
+                    const delay = statusCode === 515 ? 1000 : 3000;
+                    reconnectTimeout = setTimeout(() => {
+                        isReconnecting = false;
+                        initWhatsApp(true);
+                    }, delay);
                 } else {
                     console.log('❌ Logged out from WhatsApp. Clear session and restart to get a new QR code.');
                     try {
                         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                     } catch (e) {}
-                    setTimeout(() => initWhatsApp(true), 2000);
+                    setTimeout(() => {
+                        isReconnecting = false;
+                        initWhatsApp(true);
+                    }, 2000);
                 }
             } else if (connection === 'open') {
                 connectionStatus = 'connected';
                 currentQR = null;
+                isReconnecting = false;
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout);
+                    reconnectTimeout = null;
+                }
                 
                 const user = sock.user;
                 if (user) {
@@ -291,29 +439,24 @@ async function initWhatsApp(isRestart = false) {
             }
         });
 
-const debugLogs = [];
-function addLog(type, msg, data = null) {
-    const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data };
-    debugLogs.unshift(entry);
-    if (debugLogs.length > 50) debugLogs.pop();
-    console.log(`[${type}] ${msg}`);
-}
-
         // Listen for incoming messages from customers
         sock.ev.on('messages.upsert', async (m) => {
             try {
-                addLog('RAW_UPSERT', `Type: ${m.type}, Count: ${m.messages ? m.messages.length : 0}`);
                 if (m.type !== 'notify') return;
 
                 for (const msg of m.messages) {
                     if (msg.key.fromMe) {
-                        addLog('MSG_SKIPPED', 'Message from me (outgoing)');
+                        continue;
+                    }
+
+                    const msgId = msg.key.id;
+                    if (isDuplicateMessage(msgId)) {
+                        addLog('MSG_DEDUP', `Skipped duplicate message: ${msgId}`);
                         continue;
                     }
 
                     const remoteJid = msg.key.remoteJid || '';
                     if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) {
-                        addLog('MSG_SKIPPED', `Group/Broadcast: ${remoteJid}`);
                         continue;
                     }
 
@@ -340,16 +483,16 @@ function addLog(type, msg, data = null) {
                         text = msgContent.imageMessage.caption;
                     }
 
-                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"`);
-
                     if (!text) continue;
+
+                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"`);
 
                     forwardMessageToWordPress({
                         platform: 'whatsapp',
                         sender_id: senderPhone,
                         sender_name: pushName,
                         message: text,
-                        message_id: msg.key.id,
+                        message_id: msgId,
                         timestamp: Math.floor(Date.now() / 1000)
                     });
                 }
@@ -362,6 +505,7 @@ function addLog(type, msg, data = null) {
     } catch (error) {
         console.error('Failed to initialize WhatsApp socket:', error);
         connectionStatus = 'disconnected';
+        isReconnecting = false;
     }
 }
 
@@ -926,26 +1070,21 @@ app.post('/api/send', async (req, res) => {
 
         const jid = formatJid(to);
 
-        let result;
-        if (imageUrl) {
-            result = await sock.sendMessage(jid, {
-                image: { url: imageUrl },
-                caption: caption || text || ''
-            });
-        } else {
-            result = await sock.sendMessage(jid, {
-                text: text
-            });
-        }
+        // Enqueue through high-concurrency throttled OutboxQueue
+        const result = await outboxQueue.enqueue({
+            jid,
+            text,
+            imageUrl,
+            caption
+        });
 
-        console.log(`📤 [WhatsApp Sent] To: ${jid} | ID: ${result?.key?.id}`);
         return res.json({
             success: true,
             messageId: result?.key?.id,
             to: jid
         });
     } catch (err) {
-        console.error('Error sending WhatsApp message:', err);
+        console.error('Error in /api/send:', err);
         return res.status(500).json({
             success: false,
             message: err.message || 'Failed to send WhatsApp message.'
