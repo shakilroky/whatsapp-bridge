@@ -1,0 +1,20 @@
+{
+  "name": "nexora-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp Web QR Code Bridge for Nexora AI Automation",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.19",
+    "adm-zip": "^0.6.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "localtunnel": "^2.0.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "untun": "^0.2.2"
+  }
+}
