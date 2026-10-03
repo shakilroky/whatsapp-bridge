@@ -179,32 +179,53 @@ async function initWhatsApp(isRestart = false) {
             }
         });
 
+const debugLogs = [];
+function addLog(type, msg, data = null) {
+    const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data };
+    debugLogs.unshift(entry);
+    if (debugLogs.length > 50) debugLogs.pop();
+    console.log(`[${type}] ${msg}`);
+}
+
         // Listen for incoming messages from customers
         sock.ev.on('messages.upsert', async (m) => {
             try {
+                addLog('RAW_UPSERT', `Type: ${m.type}, Count: ${m.messages ? m.messages.length : 0}`);
                 if (m.type !== 'notify') return;
 
                 for (const msg of m.messages) {
-                    if (msg.key.fromMe) continue;
+                    if (msg.key.fromMe) {
+                        addLog('MSG_SKIPPED', 'Message from me (outgoing)');
+                        continue;
+                    }
 
                     const remoteJid = msg.key.remoteJid || '';
-                    if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) continue;
+                    if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) {
+                        addLog('MSG_SKIPPED', `Group/Broadcast: ${remoteJid}`);
+                        continue;
+                    }
 
                     const senderPhone = remoteJid.split('@')[0];
                     const pushName = msg.pushName || `Customer ${senderPhone.slice(-4)}`;
                     
+                    const msgContent = msg.message?.ephemeralMessage?.message || 
+                                       msg.message?.viewOnceMessage?.message || 
+                                       msg.message?.viewOnceMessageV2?.message || 
+                                       msg.message?.documentWithCaptionMessage?.message || 
+                                       msg.message;
+
                     let text = '';
-                    if (msg.message?.conversation) {
-                        text = msg.message.conversation;
-                    } else if (msg.message?.extendedTextMessage?.text) {
-                        text = msg.message.extendedTextMessage.text;
-                    } else if (msg.message?.imageMessage?.caption) {
-                        text = msg.message.imageMessage.caption;
+                    if (msgContent?.conversation) {
+                        text = msgContent.conversation;
+                    } else if (msgContent?.extendedTextMessage?.text) {
+                        text = msgContent.extendedTextMessage.text;
+                    } else if (msgContent?.imageMessage?.caption) {
+                        text = msgContent.imageMessage.caption;
                     }
 
-                    if (!text) continue;
+                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}): "${text}"`);
 
-                    console.log(`📩 [WhatsApp Incoming] +${senderPhone} (${pushName}): "${text}"`);
+                    if (!text) continue;
 
                     forwardMessageToWordPress({
                         platform: 'whatsapp',
@@ -216,6 +237,7 @@ async function initWhatsApp(isRestart = false) {
                     });
                 }
             } catch (err) {
+                addLog('UPSERT_ERR', err.message);
                 console.error('Error in messages.upsert handler:', err);
             }
         });
@@ -259,8 +281,11 @@ async function forwardMessageToWordPress(payload) {
             })
         });
 
+        const resBody = await response.text();
+        addLog('WEBHOOK_FWD', `WP Response Status: ${response.status}`, { body: resBody });
         console.log(`🚀 [Forwarded to WordPress] Status: ${response.status}`);
     } catch (err) {
+        addLog('WEBHOOK_ERR', err.message);
         console.error('⚠️ [Forward Failed] Could not deliver to WordPress webhook:', err.message);
     }
 }
@@ -849,6 +874,11 @@ app.get('/health', (req, res) => {
         tunnelUrl: tunnelUrl,
         status_wa: connectionStatus 
     });
+});
+
+// Real-time debug logs endpoint
+app.get('/api/debug-logs', (req, res) => {
+    res.json(debugLogs);
 });
 
 // Start Server
