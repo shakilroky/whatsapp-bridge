@@ -322,17 +322,18 @@ function addLog(type, msg, data = null) {
     try {
         let safeData = null;
         if (data !== null && data !== undefined) {
-            if (typeof data === 'object') {
-                try {
-                    safeData = JSON.parse(JSON.stringify(data, (k, v) => typeof v === 'bigint' ? v.toString() : v));
-                } catch (e) {
-                    safeData = String(data);
-                }
-            } else {
-                safeData = data;
+            try {
+                safeData = typeof data === 'object' ? JSON.stringify(data).slice(0, 500) : String(data);
+            } catch (e) {
+                safeData = String(data);
             }
         }
-        const entry = { time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), type, msg, data: safeData };
+        const entry = { 
+            time: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' }), 
+            type: String(type || 'INFO'), 
+            msg: String(msg || ''), 
+            data: safeData 
+        };
         debugLogs.unshift(entry);
         if (debugLogs.length > 50) debugLogs.pop();
     } catch (e) {}
@@ -1179,9 +1180,15 @@ app.get('/health', (req, res) => {
 // Real-time debug logs endpoint
 app.get('/api/debug-logs', (req, res) => {
     try {
-        res.json(debugLogs || []);
+        const safeList = Array.isArray(debugLogs) ? debugLogs.map(l => ({
+            time: l?.time || '',
+            type: l?.type || 'INFO',
+            msg: String(l?.msg || ''),
+            data: l?.data ? String(l.data).slice(0, 500) : null
+        })) : [];
+        return res.status(200).json(safeList);
     } catch (e) {
-        res.json([]);
+        return res.status(200).json([]);
     }
 });
 
