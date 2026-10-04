@@ -1201,4 +1201,21 @@ app.listen(PORT, '0.0.0.0', async () => {
     if (!process.env.NO_TUNNEL) {
         initTunnel();
     }
+
+    // Keep Render awake by self-pinging every 8 minutes (Render sleeps after 15m of inactivity)
+    const BRIDGE_PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || 'https://whatsapp-bridge-dfc0.onrender.com';
+    setInterval(async () => {
+        try {
+            const pingUrl = `${BRIDGE_PUBLIC_URL.replace(/\/$/, '')}/health`;
+            const res = await fetch(pingUrl, {
+                headers: { 'User-Agent': 'Nexora-Bridge-KeepAlive/1.0' }
+            });
+            if (res.ok) {
+                console.log(`💓 [Keep-Alive] Self-ping OK at ${new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka' })}`);
+            }
+        } catch (e) {
+            console.warn(`⚠️ [Keep-Alive] Ping error: ${e.message}`);
+        }
+    }, 8 * 60 * 1000);
 });
+
