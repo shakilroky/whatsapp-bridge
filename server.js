@@ -6,7 +6,7 @@ import makeWASocket, {
     DisconnectReason, 
     useMultiFileAuthState, 
     fetchLatestBaileysVersion,
-    downloadMediaMessage
+    downloadContentFromMessage
 } from '@whiskeysockets/baileys';
 import fs from 'fs';
 import path from 'path';
@@ -517,27 +517,30 @@ async function initWhatsApp(isRestart = false) {
                     let text = '';
                     let imageBase64 = null;
 
+                    const imageMsg = msgContent?.imageMessage || 
+                                     msg.message?.imageMessage || 
+                                     msg.message?.viewOnceMessage?.message?.imageMessage || 
+                                     msg.message?.viewOnceMessageV2?.message?.imageMessage || 
+                                     msg.message?.ephemeralMessage?.message?.imageMessage;
+
                     if (msgContent?.conversation) {
                         text = msgContent.conversation;
                     } else if (msgContent?.extendedTextMessage?.text) {
                         text = msgContent.extendedTextMessage.text;
-                    } else if (msgContent?.imageMessage?.caption) {
-                        text = msgContent.imageMessage.caption;
+                    } else if (imageMsg?.caption) {
+                        text = imageMsg.caption;
                     }
 
                     // Check for incoming customer product photo / image
-                    if (msgContent?.imageMessage) {
+                    if (imageMsg) {
                         try {
-                            const buffer = await downloadMediaMessage(
-                                msg,
-                                'buffer',
-                                {},
-                                {
-                                    reuploadRequest: sock.updateMediaMessage
-                                }
-                            );
-                            if (buffer && buffer.length > 0) {
-                                const mime = msgContent.imageMessage.mimetype || 'image/jpeg';
+                            const stream = await downloadContentFromMessage(imageMsg, 'image');
+                            let buffer = Buffer.from([]);
+                            for await (const chunk of stream) {
+                                buffer = Buffer.concat([buffer, chunk]);
+                            }
+                            if (buffer.length > 0) {
+                                const mime = imageMsg.mimetype || 'image/jpeg';
                                 imageBase64 = `data:${mime};base64,${buffer.toString('base64')}`;
                                 addLog('MEDIA_DL', `Downloaded customer image (${buffer.length} bytes)`);
                             }
