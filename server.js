@@ -36,6 +36,17 @@ function saveJidMap() {
     } catch (e) {}
 }
 
+// In-memory message cache for Signal retry requests (getMessage)
+const messageStore = new Map();
+function saveMessageToStore(msg) {
+    if (!msg?.key?.id || !msg?.message) return;
+    messageStore.set(msg.key.id, msg.message);
+    if (messageStore.size > 3000) {
+        const firstKey = messageStore.keys().next().value;
+        messageStore.delete(firstKey);
+    }
+}
+
 // Configuration
 let wpWebhookUrl = process.env.WP_WEBHOOK_URL || 'https://metromaa.com/wp-json/socialsync/v1/webhook';
 let wpVerifyToken = process.env.WP_VERIFY_TOKEN || 'my_secret_token_123';
@@ -288,6 +299,10 @@ class OutboxQueue {
                     });
                 }
 
+                if (result) {
+                    saveMessageToStore(result);
+                }
+
                 try {
                     await sock.sendPresenceUpdate('paused', item.jid);
                 } catch (e) {}
@@ -373,15 +388,18 @@ async function initWhatsApp(isRestart = false) {
             logger,
             printQRInTerminal: false,
             auth: state,
-            browser: ['Ubuntu', 'Chrome', '22.04.4'],
+            browser: ['Nexora AI Automation', 'Chrome', '124.0.0.0'],
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000,
+            keepAliveIntervalMs: 15000,
             retryRequestDelayMs: 500,
             maxMsgRetryCount: 5,
             getMessage: async (key) => {
-                return { conversation: '' };
+                if (key?.id && messageStore.has(key.id)) {
+                    return messageStore.get(key.id);
+                }
+                return undefined;
             },
             shouldIgnoreJid: (jid) => jid.endsWith('@broadcast') || jid.endsWith('@newsletter'),
         });
@@ -465,6 +483,8 @@ async function initWhatsApp(isRestart = false) {
                 if (m.type !== 'notify') return;
 
                 for (const msg of m.messages) {
+                    saveMessageToStore(msg);
+
                     if (msg.key.fromMe) {
                         continue;
                     }
@@ -480,12 +500,40 @@ async function initWhatsApp(isRestart = false) {
                         continue;
                     }
 
-                    const senderPhone = remoteJid.split('@')[0];
+                    let senderPhone = remoteJid.split('@')[0];
                     const pushName = msg.pushName || `Customer ${senderPhone.slice(-4)}`;
 
-                    // Track JID mapping for WhatsApp Privacy LIDs (@lid) vs standard numbers (@s.whatsapp.net)
-                    jidMap[senderPhone] = remoteJid;
-                    jidMap[remoteJid] = remoteJid;
+                    // If it's a WhatsApp Privacy LID, attempt to resolve phone number
+                    if (remoteJid.endsWith('@lid')) {
+                        try {
+                            const pnJid = await sock?.signalRepository?.lidMapping?.getPNForLID(remoteJid);
+                            if (pnJid) {
+                                const cleanPn = pnJid.split('@')[0];
+                                if (cleanPn) {
+                                    jidMap[cleanPn] = remoteJid;
+                                    jidMap[remoteJid] = pnJid;
+                                    jidMap[senderPhone] = pnJid;
+                                    senderPhone = cleanPn;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Check if we previously mapped this LID to a real phone number
+                    if (jidMap[senderPhone] && jidMap[senderPhone].endsWith('@s.whatsapp.net')) {
+                        const mappedPn = jidMap[senderPhone].split('@')[0];
+                        if (mappedPn) {
+                            senderPhone = mappedPn;
+                        }
+                    } else if (jidMap[remoteJid] && jidMap[remoteJid].endsWith('@s.whatsapp.net')) {
+                        const mappedPn = jidMap[remoteJid].split('@')[0];
+                        if (mappedPn) {
+                            senderPhone = mappedPn;
+                        }
+                    } else {
+                        jidMap[senderPhone] = remoteJid;
+                        jidMap[remoteJid] = remoteJid;
+                    }
                     saveJidMap();
                     
                     const msgContent = msg.message?.ephemeralMessage?.message || 
@@ -501,6 +549,21 @@ async function initWhatsApp(isRestart = false) {
                         text = msgContent.extendedTextMessage.text;
                     } else if (msgContent?.imageMessage?.caption) {
                         text = msgContent.imageMessage.caption;
+                    }
+
+                    // If text contains a Bangladeshi phone number, auto-link to LID
+                    if (text) {
+                        const phoneMatch = text.match(/(?:(?:\+|00)880|01)\s*[13-9]\d{2}[\s-]*\d{6}/);
+                        if (phoneMatch) {
+                            const digits = phoneMatch[0].replace(/\D/g, '');
+                            const fullPn = digits.startsWith('880') ? digits : ('880' + digits.replace(/^0/, ''));
+                            if (fullPn.length === 13) {
+                                jidMap[senderPhone] = `${fullPn}@s.whatsapp.net`;
+                                jidMap[remoteJid] = `${fullPn}@s.whatsapp.net`;
+                                jidMap[fullPn] = remoteJid;
+                                saveJidMap();
+                            }
+                        }
                     }
 
                     // Check for Click-to-WhatsApp (CTWA) Ad context
@@ -609,9 +672,20 @@ function formatJid(target) {
 
     const cleanDigits = target.replace(/\D/g, '');
 
-    // Check if we mapped this user's JID previously (e.g. from incoming message)
+    // Check if we mapped this user's JID previously (e.g. from incoming message or phone link)
     if (jidMap[target]) return jidMap[target];
     if (jidMap[cleanDigits]) return jidMap[cleanDigits];
+
+    // Standard phone number format (01... or 8801...)
+    if (cleanDigits.startsWith('01') || cleanDigits.startsWith('880') || cleanDigits.length === 11 || cleanDigits.length === 13) {
+        let phone = cleanDigits;
+        if (phone.startsWith('0')) {
+            phone = '88' + phone;
+        } else if (phone.length === 10 && phone.startsWith('1')) {
+            phone = '880' + phone;
+        }
+        return `${phone}@s.whatsapp.net`;
+    }
 
     // If cleanDigits is 14+ characters and doesn't begin with Bangladesh prefixes (880 or 01), it's a WhatsApp LID
     if (cleanDigits.length >= 14 && !cleanDigits.startsWith('880') && !cleanDigits.startsWith('01')) {
