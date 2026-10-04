@@ -500,40 +500,11 @@ async function initWhatsApp(isRestart = false) {
                         continue;
                     }
 
-                    let senderPhone = remoteJid.split('@')[0];
+                    const senderPhone = remoteJid.split('@')[0];
                     const pushName = msg.pushName || `Customer ${senderPhone.slice(-4)}`;
 
-                    // If it's a WhatsApp Privacy LID, attempt to resolve phone number
-                    if (remoteJid.endsWith('@lid')) {
-                        try {
-                            const pnJid = await sock?.signalRepository?.lidMapping?.getPNForLID(remoteJid);
-                            if (pnJid) {
-                                const cleanPn = pnJid.split('@')[0];
-                                if (cleanPn) {
-                                    jidMap[cleanPn] = remoteJid;
-                                    jidMap[remoteJid] = pnJid;
-                                    jidMap[senderPhone] = pnJid;
-                                    senderPhone = cleanPn;
-                                }
-                            }
-                        } catch (e) {}
-                    }
-
-                    // Check if we previously mapped this LID to a real phone number
-                    if (jidMap[senderPhone] && jidMap[senderPhone].endsWith('@s.whatsapp.net')) {
-                        const mappedPn = jidMap[senderPhone].split('@')[0];
-                        if (mappedPn) {
-                            senderPhone = mappedPn;
-                        }
-                    } else if (jidMap[remoteJid] && jidMap[remoteJid].endsWith('@s.whatsapp.net')) {
-                        const mappedPn = jidMap[remoteJid].split('@')[0];
-                        if (mappedPn) {
-                            senderPhone = mappedPn;
-                        }
-                    } else {
-                        jidMap[senderPhone] = remoteJid;
-                        jidMap[remoteJid] = remoteJid;
-                    }
+                    jidMap[senderPhone] = remoteJid;
+                    jidMap[remoteJid] = remoteJid;
                     saveJidMap();
                     
                     const msgContent = msg.message?.ephemeralMessage?.message || 
