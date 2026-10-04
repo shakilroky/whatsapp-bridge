@@ -373,12 +373,17 @@ async function initWhatsApp(isRestart = false) {
             logger,
             printQRInTerminal: false,
             auth: state,
-            browser: ['Nexora AI Automation', 'Chrome', '124.0.0.0'],
+            browser: ['Ubuntu', 'Chrome', '22.04.4'],
+            syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 15000,
+            keepAliveIntervalMs: 25000,
             retryRequestDelayMs: 500,
             maxMsgRetryCount: 5,
+            getMessage: async (key) => {
+                return { conversation: '' };
+            },
+            shouldIgnoreJid: (jid) => jid.endsWith('@broadcast') || jid.endsWith('@newsletter'),
         });
 
         isReconnecting = false;
