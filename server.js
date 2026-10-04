@@ -5,7 +5,8 @@ import pino from 'pino';
 import makeWASocket, { 
     DisconnectReason, 
     useMultiFileAuthState, 
-    fetchLatestBaileysVersion 
+    fetchLatestBaileysVersion,
+    downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import fs from 'fs';
 import path from 'path';
@@ -514,6 +515,8 @@ async function initWhatsApp(isRestart = false) {
                                        msg.message;
 
                     let text = '';
+                    let imageBase64 = null;
+
                     if (msgContent?.conversation) {
                         text = msgContent.conversation;
                     } else if (msgContent?.extendedTextMessage?.text) {
@@ -522,8 +525,33 @@ async function initWhatsApp(isRestart = false) {
                         text = msgContent.imageMessage.caption;
                     }
 
+                    // Check for incoming customer product photo / image
+                    if (msgContent?.imageMessage) {
+                        try {
+                            const buffer = await downloadMediaMessage(
+                                msg,
+                                'buffer',
+                                {},
+                                {
+                                    reuploadRequest: sock.updateMediaMessage
+                                }
+                            );
+                            if (buffer && buffer.length > 0) {
+                                const mime = msgContent.imageMessage.mimetype || 'image/jpeg';
+                                imageBase64 = `data:${mime};base64,${buffer.toString('base64')}`;
+                                addLog('MEDIA_DL', `Downloaded customer image (${buffer.length} bytes)`);
+                            }
+                        } catch (mediaErr) {
+                            addLog('MEDIA_ERR', `Failed to download media: ${mediaErr.message}`);
+                        }
+                    }
+
+                    if (!text && imageBase64) {
+                        text = '[ছবি / Image]';
+                    }
+
                     // If text contains a Bangladeshi phone number, auto-link to LID
-                    if (text) {
+                    if (text && text !== '[ছবি / Image]') {
                         const phoneMatch = text.match(/(?:(?:\+|00)880|01)\s*[13-9]\d{2}[\s-]*\d{6}/);
                         if (phoneMatch) {
                             const digits = phoneMatch[0].replace(/\D/g, '');
@@ -554,15 +582,16 @@ async function initWhatsApp(isRestart = false) {
                         addLog('AD_CLICK', `User clicked WhatsApp Ad: "${adContext.title}" (${adContext.source_url})`);
                     }
 
-                    if (!text) continue;
+                    if (!text && !imageBase64) continue;
 
-                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"` + (adContext ? ` [Ad: ${adContext.title}]` : ''));
+                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"` + (imageBase64 ? ' [Image Attached]' : '') + (adContext ? ` [Ad: ${adContext.title}]` : ''));
 
                     forwardMessageToWordPress({
                         platform: 'whatsapp',
                         sender_id: senderPhone,
                         sender_name: pushName,
                         message: text,
+                        image_url: imageBase64,
                         message_id: msgId,
                         ad_context: adContext,
                         timestamp: Math.floor(Date.now() / 1000)
@@ -607,7 +636,12 @@ async function forwardMessageToWordPress(payload) {
                                 id: payload.message_id,
                                 timestamp: String(payload.timestamp),
                                 text: { body: payload.message },
-                                type: 'text',
+                                type: payload.image_url ? 'image' : 'text',
+                                image_url: payload.image_url || undefined,
+                                image: payload.image_url ? {
+                                    url: payload.image_url,
+                                    caption: (payload.message && payload.message !== '[ছবি / Image]') ? payload.message : ''
+                                } : undefined,
                                 referral: payload.ad_context ? {
                                     source_type: 'ad',
                                     headline: payload.ad_context.title,
