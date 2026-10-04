@@ -498,9 +498,26 @@ async function initWhatsApp(isRestart = false) {
                         text = msgContent.imageMessage.caption;
                     }
 
+                    // Check for Click-to-WhatsApp (CTWA) Ad context
+                    const contextInfo = msgContent?.extendedTextMessage?.contextInfo || 
+                                        msgContent?.contextInfo || 
+                                        msg.message?.extendedTextMessage?.contextInfo || 
+                                        msg.message?.contextInfo;
+                    let adContext = null;
+                    if (contextInfo?.externalAdReply) {
+                        const ear = contextInfo.externalAdReply;
+                        adContext = {
+                            title: ear.title || '',
+                            body: ear.body || '',
+                            source_url: ear.sourceUrl || '',
+                            thumbnail_url: ear.thumbnailUrl || ''
+                        };
+                        addLog('AD_CLICK', `User clicked WhatsApp Ad: "${adContext.title}" (${adContext.source_url})`);
+                    }
+
                     if (!text) continue;
 
-                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"`);
+                    addLog('MSG_PARSED', `From: +${senderPhone} (${pushName}) [${remoteJid}]: "${text}"` + (adContext ? ` [Ad: ${adContext.title}]` : ''));
 
                     forwardMessageToWordPress({
                         platform: 'whatsapp',
@@ -508,6 +525,7 @@ async function initWhatsApp(isRestart = false) {
                         sender_name: pushName,
                         message: text,
                         message_id: msgId,
+                        ad_context: adContext,
                         timestamp: Math.floor(Date.now() / 1000)
                     });
                 }
@@ -544,12 +562,20 @@ async function forwardMessageToWordPress(payload) {
                                 wa_id: payload.sender_id,
                                 profile: { name: payload.sender_name }
                             }],
+                            ad_context: payload.ad_context || null,
                             messages: [{
                                 from: payload.sender_id,
                                 id: payload.message_id,
                                 timestamp: String(payload.timestamp),
                                 text: { body: payload.message },
-                                type: 'text'
+                                type: 'text',
+                                referral: payload.ad_context ? {
+                                    source_type: 'ad',
+                                    headline: payload.ad_context.title,
+                                    body: payload.ad_context.body,
+                                    source_url: payload.ad_context.source_url,
+                                    thumbnail_url: payload.ad_context.thumbnail_url
+                                } : undefined
                             }]
                         }
                     }]
